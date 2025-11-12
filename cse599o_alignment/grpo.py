@@ -49,28 +49,6 @@ def compute_group_normalized_reward(
     """
     pass
 
-
-def compute_naive_policy_gradient_loss(
-    raw_rewards_or_advantages: torch.Tensor,   
-    policy_log_probs: torch.Tensor      
-) -> torch.Tensor:
-    """
-    Compute basic REINFORCE policy gradient loss.
-    
-    Args:
-        raw_rewards_or_advantages: torch.Tensor Shape (batch_size, 1), scalar
-        reward/advantage for each rollout response.
-        
-        policy_log_probs: torch.Tensor Shape (batch_size, sequence_length), logprobs for
-        each token.
-    
-    Returns:
-        torch.Tensor Shape (batch_size, sequence_length), the per-token policy-gradient loss (to
-        be aggregated across the batch and sequence dimensions in the training loop).
-    """
-    pass
-
-
 def compute_grpo_clip_loss(
     advantages: torch.Tensor,
     policy_log_probs: torch.Tensor,
@@ -102,45 +80,6 @@ def compute_grpo_clip_loss(
         the min was lower than the LHS.
     """
     pass
-
-
-def compute_policy_gradient_loss(
-    policy_log_probs: torch.Tensor,
-    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"],
-    raw_rewards: torch.Tensor | None=None,
-    advantages: torch.Tensor | None=None,
-    old_log_probs: torch.Tensor | None=None,
-    cliprange: float | None=None
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """
-    Unified interface for computing different policy gradient loss variants.
-    
-    Args:
-        policy_log_probs (batch_size, sequence_length), per-token log-probabilities from the
-        policy being trained.
-        
-        loss_type One of "no_baseline", "reinforce_with_baseline", or "grpo_clip".
-        
-        raw_rewards Required if loss_type == "no_baseline"; shape (batch_size, 1).
-        
-        advantages Required for "reinforce_with_baseline" and "grpo_clip"; shape
-        (batch_size, 1).
-        
-        old_log_probs Required for "grpo_clip"; shape (batch_size, sequence_length).
-        
-        cliprange Required for "grpo_clip"; scalar ϵ used for clipping.
-    
-    Returns:
-        tuple[torch.Tensor, dict[str, torch.Tensor]].
-        
-        loss (batch_size, sequence_length), per-token loss.
-        
-        metadata dict, statistics from the underlying routine (e.g., clip fraction for GRPO-Clip).
-    
-    """
-    
-    pass
-
 
 def masked_mean(
     tensor: torch.Tensor,
