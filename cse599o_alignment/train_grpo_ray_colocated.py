@@ -41,7 +41,7 @@ D_MODEL = 512
 NUM_HEADS = 16
 D_FF = 1344
 THETA = 10000
-CHECKPOINT_PATH = "/homes/iws/cxyzhao/student-version/assignment5-alignment/checkpoint/999"
+CHECKPOINT_PATH = ""
 
 
 def get_device():
