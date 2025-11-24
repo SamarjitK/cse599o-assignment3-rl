@@ -15,7 +15,7 @@ def compute_group_normalized_reward(
     group_size,
     advantage_eps,
     normalized_by_std
-):
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
     """    
     Args:
         reward_fn: Callable[[str, str], dict[str, float]] Scores the rollout responses against
@@ -47,7 +47,24 @@ def compute_group_normalized_reward(
         
         metadata: your choice of other statistics to log (e.g. mean, std, max/min of rewards).
     """
-    pass
+
+    raw_rewards_list = []
+    for response, ground_truth in zip(rollout_responses, repeated_ground_truths):
+        reward_dict = reward_fn(response, ground_truth)
+        raw_rewards_list.append(reward_dict["reward"])
+
+    raw_rewards = torch.tensor(raw_rewards_list)
+    n_prompts_per_rollout_batch = len(rollout_responses) // group_size
+    raw_rewards = raw_rewards.view(n_prompts_per_rollout_batch, group_size)
+    advantages = torch.zeros_like(raw_rewards)
+    for i in range(n_prompts_per_rollout_batch):
+        rewards = raw_rewards[i]
+        mean = torch.mean(rewards)
+        advantages[i] = (rewards - mean)
+        if normalized_by_std:
+            advantages[i] = advantages[i] / (torch.std(rewards) + advantage_eps)
+    metadata = {}
+    return advantages.view(-1), raw_rewards.view(-1), metadata
 
 def compute_grpo_clip_loss(
     advantages: torch.Tensor,
