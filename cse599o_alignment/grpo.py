@@ -96,7 +96,18 @@ def compute_grpo_clip_loss(
         token was clipped or not, i.e., whether the clipped policy gradient loss on the RHS of
         the min was lower than the LHS.
     """
-    pass
+    # grpo loss: - min (ratio * A, clip(ratio, 1 - eps, 1 + eps) * A)
+    # tip: broadcast advantages over sequence length using einops.repeat
+    # implementation goes here
+
+    ratios = torch.exp(policy_log_probs - old_log_probs)  # (batch_size, sequence_length)
+    adv = repeat(advantages, 'b 1 -> b s', s=policy_log_probs.size(1))  # (batch_size, sequence_length)
+    lhs = ratios * adv
+    rhs = torch.clamp(ratios, 1 - cliprange, 1 + cliprange) * adv
+    metadata = {
+        "clipped": (lhs > rhs).float()
+    }
+    return -torch.min(lhs, rhs), metadata
 
 def masked_mean(
     tensor: torch.Tensor,
@@ -117,7 +128,7 @@ def masked_mean(
     Returns:
         torch.Tensor The masked mean; shape matches tensor.mean(dim) semantics.
     """
-    pass
+    return (tensor * mask).sum() / mask.sum() if dim is None else (tensor * mask).sum(dim=dim) / mask.sum(dim=dim)
 
 
 def grpo_microbatch_train_step(
@@ -161,5 +172,19 @@ def grpo_microbatch_train_step(
         metadata Dict with metadata from the underlying loss call, and any other statistics you
         might want to log.
     """
-    pass
+
+    assert loss_type == "grpo_clip", "unsupported"
+    assert advantages is not None and old_log_probs is not None and cliprange is not None, \
+        "missing required arguments"
+    loss, meta = compute_grpo_clip_loss(
+        advantages,
+        policy_log_probs,
+        old_log_probs,
+        cliprange
+    )
+
+    loss = masked_mean(loss, response_mask, dim=1).mean() / gradient_accumulation_steps
+    loss.backward()
+
+    return loss, meta
 

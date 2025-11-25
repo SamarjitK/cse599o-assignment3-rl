@@ -10,6 +10,8 @@ from transformers import PreTrainedTokenizerBase
 from cse599o_alignment.grpo import (
     compute_group_normalized_reward,
     compute_grpo_clip_loss,
+    masked_mean,
+    grpo_microbatch_train_step
 )
 
 
@@ -171,7 +173,12 @@ def run_compute_grpo_clip_loss(
             dict[str, torch.Tensor]: metadata for the GRPO-Clip loss 
                 (used to compute clip fraction).
     """
-    raise NotImplementedError
+    return compute_grpo_clip_loss(
+        advantages,
+        policy_log_probs,
+        old_log_probs,
+        cliprange,
+    )
 
 
 def run_compute_policy_gradient_loss(
@@ -204,7 +211,7 @@ def run_masked_mean(tensor: torch.Tensor, mask: torch.Tensor, dim: int | None = 
         torch.Tensor, the mean of the tensor along the specified
             dimension, considering only the elements with mask value 1.
     """
-    raise NotImplementedError
+    return masked_mean(tensor, mask, dim)
 
 def run_sft_microbatch_train_step(
     policy_log_probs: torch.Tensor,
@@ -253,7 +260,17 @@ def run_grpo_microbatch_train_step(
         tuple[torch.Tensor, dict[str, torch.Tensor]]: 
             the policy gradient loss and its metadata.
     """
-    raise NotImplementedError
+    assert loss_type == "grpo_clip", "For this assignment, only 'grpo_clip' is required."
+    return grpo_microbatch_train_step(
+        policy_log_probs,
+        response_mask,
+        gradient_accumulation_steps,
+        loss_type,
+        raw_rewards,
+        advantages,
+        old_log_probs,
+        cliprange,
+    )
 
 
 def run_masked_normalize(
