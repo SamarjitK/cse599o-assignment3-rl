@@ -206,7 +206,7 @@ def run_test_ray_actor_creation(num_workers: int = 1) -> Dict[str, Any]:
         Dict containing actor creation test results
     """
     if not ray.is_initialized():
-        ray.init(ignore_reinit_error=True)
+        ray.init(ignore_reinit_error=True, _temp_dir="/local1/samarjit")
     
     try:
         from cse599o_alignment.train_grpo_ray_colocated import ColocatedWorker

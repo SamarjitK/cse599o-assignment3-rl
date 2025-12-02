@@ -222,5 +222,5 @@ if __name__ == "__main__":
     parser.add_argument("--steps", type=int, default=3)
     args = parser.parse_args()
 
-    ray.init(ignore_reinit_error=True)
+    ray.init(ignore_reinit_error=True, _temp_dir="/local1/samarjit")
     run_once(num_steps=args.steps)

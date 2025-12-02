@@ -7,11 +7,11 @@ from typing import BinaryIO, IO
 from cse599o_basics.model_utils import cross_entropy, softmax, lr_scheduler, gradient_clipping
 from cse599o_basics.transformer_lm import TransformerLM
 from cse599o_basics.adamw import AdamW
-from cse599o_basics.tokenizer import BPETokenizer
+import tiktoken
 
-def decode(model: TransformerLM, tokenizer: BPETokenizer, optim: AdamW,
+def decode(model: TransformerLM, tokenizer: tiktoken.Encoding, optim: AdamW,
            max_tokens:int = 256, temperature: float = 1.0, top_p: float = 0.9, 
-           prompt: str = "Once upon a time", ckpt_file: str = "") -> str:
+           prompt: str = "Once upon a time", ckpt_file: str = "") -> tuple[str, list[float]]:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
@@ -25,10 +25,13 @@ def decode(model: TransformerLM, tokenizer: BPETokenizer, optim: AdamW,
     model.eval()
     input_tokens = torch.tensor(tokenizer.encode(prompt)) # (seq_len,)
     input_tensor = input_tokens.unsqueeze(0).to(device) # (1, seq_len)
-    eot = tokenizer.tokenizer.eot_token
+    eot = tokenizer.eot_token
 
     # keep list of generated tokens
     generated_tokens = input_tokens.tolist()
+
+    # keep list of log probs
+    log_probs = []
 
     with torch.no_grad():
         for _ in range(max_tokens - input_tokens.size(0)):
@@ -47,13 +50,14 @@ def decode(model: TransformerLM, tokenizer: BPETokenizer, optim: AdamW,
             index = torch.multinomial(top_p_probs, 1)
             next_token = top_p_indices[index] # (1,)
             generated_tokens.append(next_token.item())
+            log_probs.append(torch.log(top_p_probs[index]).item())
             if next_token.item() == eot:
                 break
             input_tensor = torch.cat([input_tensor, next_token.unsqueeze(0).to(device)], dim=1)
 
-    return tokenizer.decode(generated_tokens)
+    return tokenizer.decode(generated_tokens), log_probs
 
-def prep_datasets(train_txt: str, valid_txt: str, tokenizer: BPETokenizer):
+def prep_datasets(train_txt: str, valid_txt: str, tokenizer: tiktoken.Encoding):
     if not os.path.exists("data/train_memmap.dat"):
         print("Tokenizing training data...")
         with open(train_txt, "r", encoding="utf-8") as f:
