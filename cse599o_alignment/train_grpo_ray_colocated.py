@@ -26,6 +26,7 @@ import numpy as np
 from cse599o_basics.transformer_lm import TransformerLM
 from cse599o_basics.adamw import AdamW
 from cse599o_basics.train_utils import decode, load_checkpoint
+from cse599o_basics.model_utils import softmax
 from cse599o_alignment.grpo import (
     compute_group_normalized_reward,
     grpo_microbatch_train_step,
@@ -60,7 +61,7 @@ class Trajectory:
         prompts: List[str],  # shape: [G]
         responses: List[str],  # shape: [G]
         rewards: torch.Tensor,  # shape: [G]
-        log_probs: torch.Tensor,  # shape: [G]
+        log_probs: List[torch.Tensor],  # shape: [G]
         values: Optional[torch.Tensor] = None,  # shape: [G]
     ):
         self.prompts = prompts
@@ -125,7 +126,7 @@ class Generator:
                 prompts=[prompt]*G,
                 responses=responses,
                 rewards=torch.zeros(G, device=self.device),  # Placeholder
-                log_probs=torch.cat(log_probs_list, dim=0)
+                log_probs=log_probs_list
             ))
         return trajectories
 
@@ -178,6 +179,23 @@ class Learner:
             advantages.append(advantage)
         return torch.cat(advantages, dim=0).to(self.device)
     
+    def regenerate_probs(self, prompt: str, response: str) -> torch.Tensor:
+        prompt_tokens = self.tokenizer.encode(prompt, disallowed_special=())
+        resp_tokens = self.tokenizer.encode(response, disallowed_special=())
+        input_tokens = prompt_tokens + resp_tokens
+        input_tensor = torch.tensor(input_tokens, device=self.device).unsqueeze(0)  # (1, seq_len)
+
+        # still running into issues even with the seq_len - 1. So lets assert and check that that isn't the issue
+        assert input_tensor[:, :-1].shape[1] <= CONTEXT_LENGTH, f"input_tensor too long: {input_tensor[:, :-1].shape[1]} >= {CONTEXT_LENGTH}. Prompt len: {len(prompt_tokens)}, Response len: {len(resp_tokens)}\
+            for ref: prompt='{prompt}', response='{response}'"
+
+        outputs = self.model(input_tensor[:, :-1])  # (1, seq_len-1, vocab_size)
+        probs = softmax(outputs, dim=-1)  # (1, seq_len-1, vocab_size)
+
+        target_tokens = input_tensor[:, 1:].squeeze(0)  # (seq_len-1,)
+        selected = probs[0].gather(1, target_tokens.unsqueeze(1))
+        return torch.log(selected.squeeze(1))  # (seq_len-1,)
+    
     def update_policy(self, trajectories: List[Trajectory]) -> float:
         """Perform one policy update step."""
         # TODO: Implement GRPO/PPO policy update
@@ -186,21 +204,38 @@ class Learner:
         # 3. Perform optimizer step
         # 4. Return loss value
 
-        advantages = self.compute_advantages(trajectories)
-        # policy_log_probs = torch.cat([traj.log_probs for traj in trajectories], dim=0)
-        # we expect that for a trajectory, log_probs is a tensor of shape (G, seq_len)
-        # we want to concatenate each trajectory so that we have (num_trajectories * G, seq_len)
-        # first verify shape of log_probs
-        print(f"Log probs shape per trajectory: {trajectories[0].log_probs.shape}", flush=True)
-        policy_log_probs = torch.cat([traj.log_probs.unsqueeze(0) for traj in trajectories], dim=0).view(-1, trajectories[0].log_probs.shape[-1])
-        old_log_probs = policy_log_probs.detach()
+        advantages = self.compute_advantages(trajectories).unsqueeze(-1)  # shape: (batch_size, 1)
+        batch_size = len(trajectories) * G
+        old_log_probs = torch.zeros(batch_size, CONTEXT_LENGTH, device=self.device)
+        mask = torch.zeros(batch_size, CONTEXT_LENGTH, device=self.device)
+        for i, traj in enumerate(trajectories):
+            start_i = i * G
+            prompt_len = len(self.tokenizer.encode(traj.prompts[0]))
+            for g in range(G):
+                log_probs = traj.log_probs[g]
+                response_len = log_probs.shape[0]
+                old_log_probs[start_i + g, (prompt_len - 1):(prompt_len + response_len - 1)] = log_probs
+                mask[start_i + g, (prompt_len - 1):(prompt_len + response_len - 1)] = 1.0
+        
+        old_log_probs = old_log_probs.detach()
+
+        self.model.train()
+        policy_log_probs = torch.zeros_like(old_log_probs).to(self.device)
+        for i, traj in enumerate(trajectories):
+            start_i = i * G
+            for g in range(G):
+                prompt = traj.prompts[g]
+                response = traj.responses[g]
+                selected_probs = self.regenerate_probs(prompt, response)
+                policy_log_probs[start_i + g, :selected_probs.shape[0]] = selected_probs
+    
         self.optim.zero_grad()
         loss, _ = grpo_microbatch_train_step(
             policy_log_probs=policy_log_probs,
-            response_mask=torch.ones_like(policy_log_probs, device=self.device),
+            response_mask=mask,
             gradient_accumulation_steps=1,
             loss_type="grpo_clip",
-            advantages=advantages.unsqueeze(1),
+            advantages=advantages,
             old_log_probs=old_log_probs,
             cliprange=0.2
         )
@@ -229,9 +264,11 @@ class ColocatedWorker(Generator, Learner):
     def training_step(self, prompts: List[str]) -> Dict[str, Any]:
         """Perform one complete training step: generate rollout + update policy."""
         # Generate trajectories for the batch of prompts
+        print(f"Generating trajectories for {len(prompts)} prompts...", flush=True)
         trajectories = self.generate_trajectories(prompts)
         
         # Update policy using GRPO
+        print("Updating policy...", flush=True)
         loss = self.update_policy(trajectories)
         
         self.step_count += 1
@@ -249,7 +286,6 @@ class ColocatedWorker(Generator, Learner):
             'step_count': self.step_count,
             'model_parameters': sum(p.numel() for p in self.model.parameters()) if hasattr(self, 'model') else 0
         }
-
 
 # ===================== Training loop =====================
 
@@ -299,6 +335,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     ray.init(ignore_reinit_error=True, _temp_dir="/local1/samarjit",
+             _system_config={
+                    "enable_metrics_collection": False,
+             },
              runtime_env={
                 "excludes": [
                     ".git/**",                           # git metadata and objects

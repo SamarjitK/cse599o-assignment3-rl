@@ -13,28 +13,30 @@ def decode(model: TransformerLM, tokenizer: tiktoken.Encoding, optim: AdamW,
            max_tokens:int = 256, temperature: float = 1.0, top_p: float = 0.9, 
            prompt: str = "Once upon a time", ckpt_file: str = "") -> tuple[str, list[float]]:
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
+    # print(f"Using device: {device}")
 
     if ckpt_file and os.path.exists(ckpt_file):
         print("Loading checkpoint...")
         load_checkpoint(ckpt_file, model, optim)
-    else:
-        print("No checkpoint. I sure hope you've trained this model!")
+    # else:
+        # print("No checkpoint. I sure hope you've trained this model!")
 
     print("Generating text...")
     model.eval()
     input_tokens = torch.tensor(tokenizer.encode(prompt)) # (seq_len,)
+    input_length = input_tokens.size(0)
     input_tensor = input_tokens.unsqueeze(0).to(device) # (1, seq_len)
     eot = tokenizer.eot_token
 
     # keep list of generated tokens
-    generated_tokens = input_tokens.tolist()
+    # generated_tokens = input_tokens.tolist()
+    generated_tokens = []
 
     # keep list of log probs
     log_probs = []
 
     with torch.no_grad():
-        for _ in range(max_tokens - input_tokens.size(0)):
+        for _ in range(max_tokens - input_length):
             outputs = model(input_tensor) # (1, seq_len, vocab_size)
             last_token_softmax = softmax(outputs[0, -1, :] / temperature, dim=-1) # (vocab_size,)
             sorted_probs, sorted_indices = torch.sort(last_token_softmax, descending=True)
