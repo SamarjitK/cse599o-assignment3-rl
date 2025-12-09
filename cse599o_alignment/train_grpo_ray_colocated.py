@@ -46,10 +46,63 @@ D_FF = 1344
 THETA = 10000
 CHECKPOINT_PATH = "/homes/iws/samarjit/workspace/cse599o/cse599o-assignment1-basics/checkpoints/ckpt_2780189.pt"
 
+N_GRPO_STEPS = 100
+LEARNING_RATE = 5e-4
+SAMPLING_TEMP = 0.8
+SAMPLING_MAX_TOKENS = 60
+ADVANTAGE_EPS = 1e-8
+LOSS_TYPE = "grpo_clip"
+USE_STD_NORM = True
 
 def get_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# ===================== Helpers =====================
+
+def create_model_optim(device) -> tuple[TransformerLM, AdamW]:
+    """Create TransformerLM model and AdamW optimizer."""
+    model = TransformerLM(
+        vocab_size=VOCAB_SIZE,
+        context_length=CONTEXT_LENGTH,
+        num_layers=NUM_LAYERS,
+        d_model=D_MODEL,
+        num_heads=NUM_HEADS,
+        d_ff=D_FF,
+        rope_theta=THETA
+    ).to(device)
+    optim_args = {
+        "lr": LEARNING_RATE,
+        "weight_decay": 0.01,
+        "betas": [
+            0.9,
+            0.999
+        ],
+        "eps": 1e-08
+    }
+    optim = AdamW(model.parameters(), **optim_args)
+
+    if os.path.exists(CHECKPOINT_PATH):
+        load_checkpoint(CHECKPOINT_PATH, model, optim)
+
+    return model, optim
+
+def regenerate_probs(prompt: str, response: str, 
+                     model: TransformerLM, tokenizer: tiktoken.Encoding, device) -> torch.Tensor:
+        prompt_tokens = tokenizer.encode(prompt, allowed_special="all")
+        resp_tokens = tokenizer.encode(response, allowed_special="all")
+        input_tokens = prompt_tokens + resp_tokens
+        input_tensor = torch.tensor(input_tokens, device=device).unsqueeze(0)  # (1, seq_len)
+
+        # still running into issues even with the seq_len - 1. So lets assert and check that that isn't the issue
+        assert input_tensor[:, :-1].shape[1] <= SAMPLING_MAX_TOKENS, f"input_tensor too long: {input_tensor[:, :-1].shape[1]} >= {SAMPLING_MAX_TOKENS}. Prompt len: {len(prompt_tokens)}, Response len: {len(resp_tokens)}\
+            for ref: prompt='{prompt}', response='{response}'"
+
+        outputs = model(input_tensor[:, :-1])  # (1, seq_len-1, vocab_size)
+        probs = softmax(outputs, dim=-1)  # (1, seq_len-1, vocab_size)
+
+        target_tokens = input_tensor[:, 1:].squeeze(0)  # (seq_len-1,)
+        selected = probs[0].gather(1, target_tokens.unsqueeze(1))
+        return torch.log(selected.squeeze(1))  # (seq_len-1,)
 
 # ===================== Data container =====================
 
@@ -79,30 +132,8 @@ class Generator:
     def __init__(self):
         self.device = get_device()
         # TODO: Initialize the TransformerLM model
-        self.model = TransformerLM(
-            vocab_size=VOCAB_SIZE,
-            context_length=CONTEXT_LENGTH,
-            num_layers=NUM_LAYERS,
-            d_model=D_MODEL,
-            num_heads=NUM_HEADS,
-            d_ff=D_FF,
-            rope_theta=THETA
-        ).to(self.device)
-        optim_args = {
-            "lr": 0.001,
-            "weight_decay": 0.01,
-            "betas": [
-                0.9,
-                0.999
-            ],
-            "eps": 1e-08
-        }
-        self.optim = AdamW(self.model.parameters(), **optim_args)
         self.tokenizer = tiktoken.get_encoding("gpt2")
-
-        if os.path.exists(CHECKPOINT_PATH):
-            load_checkpoint(CHECKPOINT_PATH, self.model, self.optim)
-        
+        self.gen_model, self.gen_optim = create_model_optim(self.device)
 
     def generate_trajectories(self, prompts: List[str]) -> List[Trajectory]:
         """
@@ -118,8 +149,10 @@ class Generator:
             responses = []
             log_probs_list = []
             for g in range(G):
-                response, log_probs = decode(self.model, self.tokenizer, self.optim, 
-                      prompt=prompt)
+                response, log_probs = decode(
+                    self.gen_model, self.tokenizer, self.gen_optim, 
+                    max_tokens=SAMPLING_MAX_TOKENS, temperature=SAMPLING_TEMP,
+                    prompt=prompt)
                 responses.append(response)
                 log_probs_list.append(torch.tensor(log_probs, device=self.device))
             trajectories.append(Trajectory(
@@ -135,29 +168,8 @@ class Learner:
     def __init__(self):
         self.device = get_device()
         # TODO: Initialize the same TransformerLM model as Generator
-        self.model = TransformerLM(
-            vocab_size=VOCAB_SIZE,
-            context_length=CONTEXT_LENGTH,
-            num_layers=NUM_LAYERS,
-            d_model=D_MODEL,
-            num_heads=NUM_HEADS,
-            d_ff=D_FF,
-            rope_theta=THETA
-        ).to(self.device)
-        optim_args = {
-            "lr": 0.001,
-            "weight_decay": 0.01,
-            "betas": [
-                0.9,
-                0.999
-            ],
-            "eps": 1e-08
-        }
-        self.optim = AdamW(self.model.parameters(), **optim_args)
         self.tokenizer = tiktoken.get_encoding("gpt2")
-
-        if os.path.exists(CHECKPOINT_PATH):
-            load_checkpoint(CHECKPOINT_PATH, self.model, self.optim)
+        self.learn_model, self.learn_optim = create_model_optim(self.device)
 
     def compute_advantages(self, trajectories: List[Trajectory]) -> torch.Tensor:
         """Compute advantages for GRPO."""
@@ -173,30 +185,13 @@ class Learner:
                 rollout_responses=traj.responses,
                 repeated_ground_truths=[keyword]*G,
                 group_size=G,
-                advantage_eps=1e-8,
-                normalized_by_std=False
+                advantage_eps=ADVANTAGE_EPS,
+                normalized_by_std=USE_STD_NORM,
             )
             advantages.append(advantage)
         return torch.cat(advantages, dim=0).to(self.device)
     
-    def regenerate_probs(self, prompt: str, response: str) -> torch.Tensor:
-        prompt_tokens = self.tokenizer.encode(prompt, disallowed_special=())
-        resp_tokens = self.tokenizer.encode(response, disallowed_special=())
-        input_tokens = prompt_tokens + resp_tokens
-        input_tensor = torch.tensor(input_tokens, device=self.device).unsqueeze(0)  # (1, seq_len)
-
-        # still running into issues even with the seq_len - 1. So lets assert and check that that isn't the issue
-        assert input_tensor[:, :-1].shape[1] <= CONTEXT_LENGTH, f"input_tensor too long: {input_tensor[:, :-1].shape[1]} >= {CONTEXT_LENGTH}. Prompt len: {len(prompt_tokens)}, Response len: {len(resp_tokens)}\
-            for ref: prompt='{prompt}', response='{response}'"
-
-        outputs = self.model(input_tensor[:, :-1])  # (1, seq_len-1, vocab_size)
-        probs = softmax(outputs, dim=-1)  # (1, seq_len-1, vocab_size)
-
-        target_tokens = input_tensor[:, 1:].squeeze(0)  # (seq_len-1,)
-        selected = probs[0].gather(1, target_tokens.unsqueeze(1))
-        return torch.log(selected.squeeze(1))  # (seq_len-1,)
-    
-    def update_policy(self, trajectories: List[Trajectory]) -> float:
+    def update_policy(self, trajectories: List[Trajectory]) -> tuple[float, torch.Tensor, torch.Tensor]:
         """Perform one policy update step."""
         # TODO: Implement GRPO/PPO policy update
         # 1. Compute advantages
@@ -206,8 +201,8 @@ class Learner:
 
         advantages = self.compute_advantages(trajectories).unsqueeze(-1)  # shape: (batch_size, 1)
         batch_size = len(trajectories) * G
-        old_log_probs = torch.zeros(batch_size, CONTEXT_LENGTH, device=self.device)
-        mask = torch.zeros(batch_size, CONTEXT_LENGTH, device=self.device)
+        old_log_probs = torch.zeros(batch_size, SAMPLING_MAX_TOKENS, device=self.device)
+        mask = torch.zeros(batch_size, SAMPLING_MAX_TOKENS, device=self.device)
         for i, traj in enumerate(trajectories):
             start_i = i * G
             prompt_len = len(self.tokenizer.encode(traj.prompts[0]))
@@ -219,30 +214,32 @@ class Learner:
         
         old_log_probs = old_log_probs.detach()
 
-        self.model.train()
+        self.learn_model.train()
         policy_log_probs = torch.zeros_like(old_log_probs).to(self.device)
         for i, traj in enumerate(trajectories):
             start_i = i * G
             for g in range(G):
                 prompt = traj.prompts[g]
                 response = traj.responses[g]
-                selected_probs = self.regenerate_probs(prompt, response)
+                selected_probs = regenerate_probs(
+                    prompt, response, self.learn_model, self.tokenizer, self.device)
                 policy_log_probs[start_i + g, :selected_probs.shape[0]] = selected_probs
     
-        self.optim.zero_grad()
+        self.learn_optim.zero_grad()
+        # create deep copy of policy_log_probs to return later
         loss, _ = grpo_microbatch_train_step(
             policy_log_probs=policy_log_probs,
             response_mask=mask,
             gradient_accumulation_steps=1,
-            loss_type="grpo_clip",
+            loss_type=LOSS_TYPE,
             advantages=advantages,
             old_log_probs=old_log_probs,
             cliprange=0.2
         )
 
-        self.optim.step()
+        self.learn_optim.step()
         
-        return loss.item()
+        return loss.item(), policy_log_probs.detach(), mask.detach()
 
     def _keyword_inclusion_reward_fn(self, response: str, keywords: List[str]) -> dict:
         """Compute reward based on keyword inclusion in the response."""
@@ -260,16 +257,52 @@ class ColocatedWorker(Generator, Learner):
         Generator.__init__(self)
         Learner.__init__(self)
         self.step_count = 0
+        self.ref_model, self.ref_optim = create_model_optim(self.device)
+        self.tokenizer = tiktoken.get_encoding("gpt2")
     
     def training_step(self, prompts: List[str]) -> Dict[str, Any]:
         """Perform one complete training step: generate rollout + update policy."""
         # Generate trajectories for the batch of prompts
+
+        # track time taken for generation
+        gen_start = time.time()
         print(f"Generating trajectories for {len(prompts)} prompts...", flush=True)
         trajectories = self.generate_trajectories(prompts)
+        print(f"Generated {len(trajectories)} trajectories in {time.time() - gen_start:.2f} seconds.", flush=True)
         
         # Update policy using GRPO
+        update_start = time.time()
         print("Updating policy...", flush=True)
-        loss = self.update_policy(trajectories)
+        loss, old_lp, mask = self.update_policy(trajectories)
+        print(f"Policy updated in {time.time() - update_start:.2f} seconds.", flush=True)
+        
+        kl_start = time.time()
+        print("Computing KL divergences...", flush=True)
+        with torch.no_grad():
+            ref_lp = torch.zeros_like(old_lp).to(self.device)
+            cur_lp = torch.zeros_like(old_lp).to(self.device)
+            for i, traj in enumerate(trajectories):
+                start_i = i * G
+                for g in range(G):
+                    prompt = traj.prompts[g]
+                    response = traj.responses[g]
+                    ref_probs = regenerate_probs(prompt, response, 
+                                             self.ref_model, self.tokenizer, self.device)
+                    ref_lp[start_i + g, :ref_probs.shape[0]] = ref_probs
+                    cur_probs = regenerate_probs(prompt, response, 
+                                             self.learn_model, self.tokenizer, self.device)
+                    cur_lp[start_i + g, :cur_probs.shape[0]] = cur_probs
+
+            kl_old = ((cur_lp - old_lp) * mask).sum() / (G * len(trajectories))
+            kl_ref = ((cur_lp - ref_lp) * mask).sum() / (G * len(trajectories))
+        print(f"KL divergences computed in {time.time() - kl_start:.2f} seconds.", flush=True)
+        print(f"KL(Current || Old): {kl_old.item():.6f}, KL(Current || Ref): {kl_ref.item():.6f}", flush=True)
+
+        # Weight synchronization to generator
+        sync_start = time.time()
+        print("Synchronizing weights to generator...", flush=True)
+        self.gen_model.load_state_dict(self.learn_model.state_dict())
+        print(f"Weights synchronized in {time.time() - sync_start:.2f} seconds.", flush=True)
         
         self.step_count += 1
         
@@ -284,7 +317,7 @@ class ColocatedWorker(Generator, Learner):
         """Get current training statistics."""
         return {
             'step_count': self.step_count,
-            'model_parameters': sum(p.numel() for p in self.model.parameters()) if hasattr(self, 'model') else 0
+            'model_parameters': sum(p.numel() for p in self.gen_model.parameters()) if hasattr(self, 'model') else 0
         }
 
 # ===================== Training loop =====================
@@ -302,11 +335,9 @@ def run_training(num_steps: int = 10, num_workers: int = 1):
             prompts.append(f"Generate a story that includes {line.strip()}")
     
     for step in range(num_steps):
-        # just get 4 prompts, assume 1 worker for simplicity
         num_prompts = 4
         batch_prompts = prompts[step * num_prompts: (step + 1) * num_prompts]
-        if num_workers == 1:
-            worker = workers[0]
+        for worker in workers:
             result = ray.get(worker.training_step.remote(batch_prompts))
             print(f"Step {result['step']}: Loss={result['loss']:.4f}, "
                   f"Num Trajectories={result['num_trajectories']}, "
@@ -318,11 +349,9 @@ def run_training(num_steps: int = 10, num_workers: int = 1):
         print(f"Worker {i} - Steps: {stats['step_count']}, "
               f"Model Params: {stats['model_parameters']}")
 
-
 def run_once(num_steps: int = 10, num_workers: int = 1):
     """Entry point for training."""
     run_training(num_steps, num_workers)
-
 
 # ===================== Entry point =====================
 
@@ -335,9 +364,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     ray.init(ignore_reinit_error=True, _temp_dir="/local1/samarjit",
-             _system_config={
-                    "enable_metrics_collection": False,
-             },
+            #  _system_config={
+            #         "enable_metrics_collection": False,
+            #  },
              runtime_env={
                 "excludes": [
                     ".git/**",                           # git metadata and objects

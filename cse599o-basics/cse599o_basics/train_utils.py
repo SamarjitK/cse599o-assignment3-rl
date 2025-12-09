@@ -21,7 +21,6 @@ def decode(model: TransformerLM, tokenizer: tiktoken.Encoding, optim: AdamW,
     # else:
         # print("No checkpoint. I sure hope you've trained this model!")
 
-    print("Generating text...")
     model.eval()
     input_tokens = torch.tensor(tokenizer.encode(prompt)) # (seq_len,)
     input_length = input_tokens.size(0)
@@ -56,7 +55,6 @@ def decode(model: TransformerLM, tokenizer: tiktoken.Encoding, optim: AdamW,
             if next_token.item() == eot:
                 break
             input_tensor = torch.cat([input_tensor, next_token.unsqueeze(0).to(device)], dim=1)
-
     return tokenizer.decode(generated_tokens), log_probs
 
 def prep_datasets(train_txt: str, valid_txt: str, tokenizer: tiktoken.Encoding):
