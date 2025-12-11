@@ -46,7 +46,7 @@ D_FF = 1344
 THETA = 10000
 CHECKPOINT_PATH = "/homes/iws/samarjit/workspace/cse599o/cse599o-assignment1-basics/checkpoints/ckpt_2780189.pt"
 
-N_GRPO_STEPS = 100
+N_GRPO_STEPS = 2
 LEARNING_RATE = 5e-4
 SAMPLING_TEMP = 0.8
 SAMPLING_MAX_TOKENS = 60
@@ -191,7 +191,7 @@ class Learner:
             advantages.append(advantage)
         return torch.cat(advantages, dim=0).to(self.device)
     
-    def update_policy(self, trajectories: List[Trajectory]) -> tuple[float, torch.Tensor, torch.Tensor]:
+    def update_policy(self, trajectories: List[Trajectory]) -> tuple[float, torch.Tensor]:
         """Perform one policy update step."""
         # TODO: Implement GRPO/PPO policy update
         # 1. Compute advantages
@@ -239,13 +239,13 @@ class Learner:
 
         self.learn_optim.step()
         
-        return loss.item(), policy_log_probs.detach(), mask.detach()
+        return loss.item(), mask.detach()
 
-    def _keyword_inclusion_reward_fn(self, response: str, keywords: List[str]) -> dict:
+    def _keyword_inclusion_reward_fn(self, response: str, keyword: str) -> dict:
         """Compute reward based on keyword inclusion in the response."""
-        for keyword in keywords:
-            if keyword not in response:
-                return {"reward": 0.0}
+        # for keyword in keywords:
+        if keyword not in response:
+            return {"reward": 0.0}
         return {"reward": 1.0}
 
 # ===================== Combined Actor =====================
@@ -267,21 +267,26 @@ class ColocatedWorker(Generator, Learner):
         # track time taken for generation
         gen_start = time.time()
         print(f"Generating trajectories for {len(prompts)} prompts...", flush=True)
-        trajectories = self.generate_trajectories(prompts)
-        print(f"Generated {len(trajectories)} trajectories in {time.time() - gen_start:.2f} seconds.", flush=True)
+        trajectories_list = []
+        for _ in range(N_GRPO_STEPS):
+            trajectories_list.append(self.generate_trajectories(prompts))
+        print(f"Generated trajectories in {time.time() - gen_start:.2f} seconds.", flush=True)
         
         # Update policy using GRPO
         update_start = time.time()
         print("Updating policy...", flush=True)
-        loss, old_lp, mask = self.update_policy(trajectories)
+        for i in range(N_GRPO_STEPS):
+            loss, mask = self.update_policy(trajectories_list[i])
         print(f"Policy updated in {time.time() - update_start:.2f} seconds.", flush=True)
-        
+        last_traj = trajectories_list[-1]
+
         kl_start = time.time()
         print("Computing KL divergences...", flush=True)
         with torch.no_grad():
-            ref_lp = torch.zeros_like(old_lp).to(self.device)
-            cur_lp = torch.zeros_like(old_lp).to(self.device)
-            for i, traj in enumerate(trajectories):
+            old_lp = torch.zeros_like(mask).to(self.device)
+            ref_lp = torch.zeros_like(mask).to(self.device)
+            cur_lp = torch.zeros_like(mask).to(self.device)
+            for i, traj in enumerate(last_traj):
                 start_i = i * G
                 for g in range(G):
                     prompt = traj.prompts[g]
@@ -292,9 +297,12 @@ class ColocatedWorker(Generator, Learner):
                     cur_probs = regenerate_probs(prompt, response, 
                                              self.learn_model, self.tokenizer, self.device)
                     cur_lp[start_i + g, :cur_probs.shape[0]] = cur_probs
+                    old_probs = regenerate_probs(prompt, response, 
+                                             self.gen_model, self.tokenizer, self.device)
+                    old_lp[start_i + g, :old_probs.shape[0]] = old_probs
 
-            kl_old = ((cur_lp - old_lp) * mask).sum() / (G * len(trajectories))
-            kl_ref = ((cur_lp - ref_lp) * mask).sum() / (G * len(trajectories))
+            kl_old = ((cur_lp - old_lp) * mask).sum() / (G * len(last_traj))
+            kl_ref = ((cur_lp - ref_lp) * mask).sum() / (G * len(last_traj))
         print(f"KL divergences computed in {time.time() - kl_start:.2f} seconds.", flush=True)
         print(f"KL(Current || Old): {kl_old.item():.6f}, KL(Current || Ref): {kl_ref.item():.6f}", flush=True)
 
@@ -309,8 +317,8 @@ class ColocatedWorker(Generator, Learner):
         return {
             'step': self.step_count,
             'loss': loss,
-            'num_trajectories': len(trajectories),
-            'avg_reward': float(torch.cat([traj.rewards for traj in trajectories]).mean()) if trajectories else 0.0
+            'num_trajectories': len(trajectories_list[-1]),
+            'avg_reward': float(torch.cat([traj.rewards for traj in last_traj]).mean()) if last_traj else 0.0
         }
     
     def get_statistics(self) -> Dict[str, Any]:
